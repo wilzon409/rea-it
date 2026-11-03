@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { mkdir, readFile, writeFile, readdir } from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import path from "node:path";
 
 const SYSTEM = `You are an autonomous build-fixing engineer. You get a goal, a project file listing,
@@ -7,9 +8,18 @@ and the output of the failing verify command. Reply with ONLY a JSON object:
 {"summary": string, "files": [{"path": string, "content": string}]}
 Each file is written in full (relative path, no ".."). Return an empty "files" array only if no change can help.`;
 
+// The verify command and any code the model writes run with only these variables, so provider API
+// keys (ANTHROPIC_API_KEY, OPENAI_API_KEY, XAI_API_KEY, ...) can't be read or exfiltrated.
+const SAFE_ENV_KEYS = [
+  "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TMPDIR", "TEMP", "TMP", "SHELL",
+  "APPDATA", "SystemRoot", "ComSpec", "PATHEXT", "WINDIR",
+];
+
 export function runCommand(cmd, cwd, timeoutMs = 600000) {
   return new Promise((resolve) => {
-    const child = spawn(cmd, { cwd, shell: true });
+    const env = {};
+    for (const k of SAFE_ENV_KEYS) if (process.env[k] !== undefined) env[k] = process.env[k];
+    const child = spawn(cmd, { cwd, shell: true, env });
     let out = "";
     const add = (d) => {
       out += d;
@@ -43,11 +53,26 @@ export function parseEdits(text) {
   return obj;
 }
 
-// Writes are confined to the project directory.
+// Writes are confined to the project directory, following symlinks on the deepest existing ancestor
+// so a link inside the project can't redirect a write outside it.
 export function safeResolve(root, rel) {
   const base = path.resolve(root);
   const abs = path.resolve(base, rel);
-  if (!abs.startsWith(base + path.sep)) throw new Error(`path escapes project: ${rel}`);
+  if (abs !== base && !abs.startsWith(base + path.sep)) throw new Error(`path escapes project: ${rel}`);
+  const realBase = realpathSync(base);
+  let probe = abs;
+  while (true) {
+    try {
+      const real = realpathSync(probe);
+      if (real !== realBase && !real.startsWith(realBase + path.sep)) throw new Error(`path escapes project: ${rel}`);
+      break;
+    } catch (err) {
+      if (err.code !== "ENOENT") throw err;
+      const parent = path.dirname(probe);
+      if (parent === probe) break;
+      probe = parent;
+    }
+  }
   return abs;
 }
 
